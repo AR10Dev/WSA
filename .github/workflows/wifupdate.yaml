@@ -1,0 +1,212 @@
+name: ✨ Update WSA (Insider Fast)
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+env:
+  tag: wif
+  prerelease: true
+  branch: WIF
+
+permissions:
+    actions: write
+    contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  wsaupdate:
+    name: "👀 Check WSA Update (Insider Fast)"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, ARM64]
+
+    steps: 
+      - name: Checkout 🛎️
+        uses: actions/checkout@v3
+      
+      - name: Check WSA Update
+        working-directory: ./scripts
+        run: |
+          RELEASED_VERSION="$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ env.tag }} | jq -r '.assets[0] | .name')"
+          python3 getWSAVersion.py ${{ matrix.arch }} ${{ env.branch }} $RELEASED_VERSION
+
+  preparerelease:
+    name: "📝 Prepare the Release"
+    needs: wsaupdate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rename tag
+        run: |
+          URL="$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ env.tag }} | jq -r .url)"
+          curl -s -X PATCH -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" $URL -d '{"tag_name":"${{ env.tag }}-outdated"}' > /dev/null
+
+      - name: Delete tag
+        run: |
+          curl -s -X DELETE -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${{ env.tag }}
+
+  build:
+    name: "👀 Build WSA ${{ matrix.arch }} (magisk: ${{ matrix.magisk }}, gapps: ${{ matrix.gapps }})"
+    needs: preparerelease
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, ARM64]
+        magisk: [None, Stable, Canary]
+        gapps: [None, Pico, Full, MindTheGapps]
+        remove_amazon: [true]
+        compression: [ZIP]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Install Dependencies
+        working-directory: ./scripts
+        run: |
+            sudo apt update && sudo apt -y install setools lzip wine winetricks patchelf e2fsprogs python3-pip aria2 p7zip-full attr xz-utils unzip
+            python3 -m pip install requests
+            cp -r ../wine/.cache/* ~/.cache
+            winetricks msxml6
+      - name: Build MagiskOnWSA
+        working-directory: ./scripts
+        run: |
+            DOWNLOAD_DIR=../download
+            DOWNLOAD_CONF_NAME=download.list
+
+            declare -A opts=( ["ARCH,x86_64"]="x64" ["ARCH,ARM64"]="arm64" ["MAGISK_VER,Stable"]="stable" ["MAGISK_VER,Beta"]="beta" ["MAGISK_VER,Canary"]="canary" ["MAGISK_VER,Debug"]="debug" ["MAGISK_VER,Custom"]="--magisk-custom" ["GAPPS_VAR,None"]="none" ["GAPPS_VAR,Pico"]="pico" ["GAPPS_VAR,Full"]="full" ["REMOVE_AMAZON,true"]="--remove-amazon" ["COMPRESSION,ZIP"]="zip" ["COMPRESSION,7-Zip"]="7z" ["COMPRESSION,XZ"]="xz" )
+
+            ARCH="${opts[ARCH,${{ matrix.arch }}]}"
+
+            RELEASE_TYPE="${{ env.branch }}"
+
+            if [[ "${{ matrix.magisk }}" != "None" ]]; then
+                ROOT_SOL="magisk"
+                MAGISK_VER="${opts[MAGISK_VER,${{ matrix.magisk }}]}"
+            else
+                ROOT_SOL="none"
+                MAGISK_VER="${opts[MAGISK_VER,Stable]}"
+            fi
+
+            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+                GAPPS_VAR="${opts[GAPPS_VAR,${{ matrix.gapps }}]}"
+            else
+                # TODO: keep it 11.0 since official opengapps does not support 12+ yet
+                # As soon as opengapps is available for 12+, we need to get the sdk/release from build.prop and download the corresponding version
+                if [[ "${{ matrix.gapps }}" != "None" ]]; then
+                    GAPPS_VAR="${opts[GAPPS_VAR,Pico]}"
+                else
+                    GAPPS_VAR="${opts[GAPPS_VAR,${{ matrix.gapps }}]}"
+                fi
+            fi
+
+            if [[ "${{ matrix.gapps }}" != "None" ]]; then
+                if [[ "${{ matrix.gapps }}" != *"MindTheGapps"* ]]; then
+                  GAPPS_BRAND="OpenGApps"
+                  if [[ "${{ matrix.gapps }}" == "Custom (OpenGApps)" ]]; then
+                    GAPPS_VARIANT_MAP=(
+                        "super"
+                        "stock"
+                        "full"
+                        "mini"
+                        "micro"
+                        "nano"
+                        "pico"
+                        "tvstock"
+                        "tvmini"
+                    )
+
+                    for file in "$DOWNLOAD_DIR"/OpenGApps-"$ARCH"-*.zip; do
+                        GAPPS_VAR=${file%%\.*}
+                        GAPPS_VAR=${GAPPS_VAR##*-}
+                        list_count=${#GAPPS_VARIANT_MAP[@]}
+                        for i in "${GAPPS_VARIANT_MAP[@]}"; do
+                            if [[ "$GAPPS_VAR" == "$i" ]]; then
+                                echo "INFO: GApps Variant: $GAPPS_VAR"
+                                valid_gapps_var="true"
+                                break
+                            fi
+                            ((list_count--))
+                            if (("$list_count" <= 0)); then
+                                echo "Invalid GApps Variant: $GAPPS_VAR"
+                            fi
+                        done
+                        if [[ "$valid_gapps_var" == "true" ]]; then
+                            break
+                        fi
+                    done
+                    if [[ "$valid_gapps_var" != "true" ]]; then
+                        echo "Missing OpenGApps file!"
+                        exit 1
+                    fi
+                    echo "opengapps_var=${GAPPS_VAR^}" >> $GITHUB_ENV
+                  fi
+                else
+                    GAPPS_VAR="pico"
+                    GAPPS_BRAND="MindTheGapps"
+                fi
+            else
+                GAPPS_VAR="pico"
+                GAPPS_BRAND="none"
+            fi
+
+            REMOVE_AMAZON="${opts[REMOVE_AMAZON,${{ matrix.remove_amazon }}]}"
+
+            COMPRESSION="--compress --compress-format ${opts[COMPRESSION,${{ matrix.compression }}]}"
+
+            COMMAND_LINE=(--arch "$ARCH" --release-type "$RELEASE_TYPE" --root-sol "$ROOT_SOL" --magisk-ver "$MAGISK_VER" "$CUSTOM_MAGISK" --gapps-brand "$GAPPS_BRAND" --gapps-variant "$GAPPS_VAR" "$COMPRESSION" "$REMOVE_AMAZON" "$OFFLINE")
+            echo "COMMAND_LINE=${COMMAND_LINE[*]}"
+
+            chmod +x ./build.sh
+            ./build.sh $(echo "${COMMAND_LINE[@]}")
+      - name: Generate Release Asset Name
+        working-directory: ./output
+        run: |
+            declare -A magisk_vers=( ["Stable"]="stable" ["Beta"]="beta" ["Canary"]="canary" ["Debug"]="debug" )
+
+            if [[ "${{ matrix.magisk }}" == "None" ]]; then
+                magiskVer=""
+            else
+                magiskVer="_Magisk-$(curl -s https://raw.githubusercontent.com/topjohnwu/magisk-files/master/${magisk_vers[${{ matrix.magisk }}]}.json | jq -r ".magisk.version")"
+            fi
+            export magiskVer
+
+            if [[ "${{ matrix.gapps }}" == "None" ]]; then
+                gappsVar=""
+            elif [[ "${{ matrix.gapps }}" == *"MindTheGapps"* ]]; then
+                gappsVar="_MindTheGapps"
+            else
+                gappsVar="_OpenGApps-${{ matrix.gapps }}"
+            fi
+            export gappsVar
+
+            if [[ "${{ matrix.remove_amazon }}" == "true" ]]; then
+                amazon=""
+            else
+                amazon="_Amazon-AppStore"
+            fi
+            export amazon
+
+            echo "release_asset_name=WSA_${{ env.WSA_VER }}_${{ matrix.arch }}$magiskVer$gappsVar${amazon}" >> $GITHUB_ENV
+            find . -maxdepth 1 -type f -name 'WSA.*' -exec bash -c 'mv "$1" "WSA_${{ env.WSA_VER }}_${{ matrix.arch }}${magiskVer}${gappsVar}${amazon}${1##*WSA}"' _ {} \;
+      - name: Upload Asset
+        uses: softprops/action-gh-release@v1
+        with:
+            files: ./output/${{ env.release_asset_name }}.*
+            name: WSA ${{ env.WSA_VER }}
+            tag_name: ${{ env.tag }}
+            prerelease: ${{ env.prerelease }}
+
+  release:
+    name: "🚀 Publish the Release"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete release
+        run: |
+          ID="$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ env.tag }}-outdated | jq -r .id)"
+          curl -s -X DELETE -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/$ID
+          curl -s -X DELETE -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${{ env.tag }}-outdated
