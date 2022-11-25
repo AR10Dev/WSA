@@ -42,7 +42,7 @@ jobs:
     name: "📝 Prepare the Release"
     needs: wsaupdate
     runs-on: ubuntu-latest
-    if: ${{ needs.wsaupdate.result != "failure" }}
+    if: ${{ !failure() }}
     steps:
       - name: Rename tag
         run: |
