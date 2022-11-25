@@ -42,7 +42,7 @@ jobs:
     name: "📝 Prepare the Release"
     needs: wsaupdate
     runs-on: ubuntu-latest
-    if: ${{ contains(fromJson('["success", "skipped"]'), needs.wsaupdate.result) }}
+    if: ${{ contains(fromJson('["success", "cancelled"]'), needs.wsaupdate.result) }}
     steps:
       - name: Rename tag
         run: |
