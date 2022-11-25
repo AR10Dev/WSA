@@ -42,6 +42,7 @@ jobs:
     name: "📝 Prepare the Release"
     needs: wsaupdate
     runs-on: ubuntu-latest
+    if: ${{ success() || skipped() }}
     steps:
       - name: Rename tag
         run: |
